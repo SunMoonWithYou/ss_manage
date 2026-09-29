@@ -2,6 +2,13 @@
 
 ###############################################################################
 # Shadowsocks-Rust 多用户管理脚本
+#
+# 功能：
+#   - 自动安装 Shadowsocks-Rust（musl 优先，gnu 回退）
+#   - 多用户管理（增删改查、续费、流量重置）
+#   - 支持永久用户（购买周期填 0 或 "无限"）
+#   - 基于 iptables 的流量统计与超限封禁
+#   - systemd 托管服务、cron 定时流量检查
 ###############################################################################
 
 set -u
@@ -32,7 +39,7 @@ CRON_FILE="/etc/cron.d/ss-manager"
 DEFAULT_PORT=8388
 
 ###############################################################################
-# 颜色
+# 颜色定义
 ###############################################################################
 
 RED='\033[0;31m'
@@ -46,7 +53,7 @@ DIM='\033[2m'
 RESET='\033[0m'
 
 ###############################################################################
-# 输出
+# 输出辅助
 ###############################################################################
 
 info()  { echo -e "${BLUE}[信息]${RESET} $*"; }
@@ -66,9 +73,7 @@ title() {
 }
 
 ###############################################################################
-# 显示宽度（CJK 算 2 列）
-#
-# 只保留 python3 版本，避免旧 bash 解析多行 (( )) 时出错。
+# 显示宽度计算（CJK 字符占 2 列）
 ###############################################################################
 
 display_width() {
@@ -109,7 +114,7 @@ pad_left() {
 }
 
 ###############################################################################
-# root
+# 权限检查
 ###############################################################################
 
 check_root() {
@@ -117,7 +122,7 @@ check_root() {
 }
 
 ###############################################################################
-# 时间
+# 时间相关
 ###############################################################################
 
 now_ts() { date +%s; }
@@ -131,8 +136,22 @@ format_ts() {
     fi
 }
 
+# 时间戳 -> 显示用文本：0 表示永久
+format_expire() {
+    local ts="${1:-0}"
+    if [[ "${ts}" =~ ^[0-9]+$ ]] && (( ts > 0 )); then
+        format_ts "${ts}"
+    else
+        echo "永久"
+    fi
+}
+
 remaining_time() {
     local target="$1" now diff days hours minutes
+    if [[ "${target}" =~ ^[0-9]+$ ]] && (( target == 0 )); then
+        echo "永久"
+        return
+    fi
     now="$(now_ts)"
     diff=$((target - now))
     if (( diff <= 0 )); then echo "已到期"; return; fi
@@ -179,7 +198,7 @@ parse_limit() {
 }
 
 ###############################################################################
-# 随机密码
+# 随机密码（24 位字母数字）
 ###############################################################################
 
 random_password() {
@@ -188,7 +207,26 @@ random_password() {
 }
 
 ###############################################################################
-# 目录初始化
+# 解析周期数输入：支持 0 / 无限 / ∞ / unlimited 表示永久
+###############################################################################
+# 返回值：0 表示永久；正整数表示周期数
+parse_periods() {
+    local input="$1"
+    case "${input}" in
+        无限|无限期|永久|∞|unlimited|UNLIMITED|Unlimited)
+            echo 0
+            return 0
+            ;;
+    esac
+    if [[ "${input}" =~ ^[0-9]+$ ]]; then
+        echo "${input}"
+        return 0
+    fi
+    return 1
+}
+
+###############################################################################
+# 目录与初始文件
 ###############################################################################
 
 init_dirs() {
@@ -203,7 +241,7 @@ init_dirs() {
 }
 
 ###############################################################################
-# 自动安装自身
+# 把当前脚本安装到 /usr/local/bin/ss-manager
 ###############################################################################
 
 install_self() {
@@ -221,7 +259,7 @@ install_self() {
 }
 
 ###############################################################################
-# 依赖
+# 依赖安装与检查
 ###############################################################################
 
 install_dependencies() {
@@ -249,6 +287,12 @@ check_dependencies() {
 
 ###############################################################################
 # 安装 Shadowsocks-Rust
+#
+# 逻辑要点：
+#   1. 优先尝试 musl 静态版（无 glibc 依赖，兼容性最好）
+#   2. musl 失败时自动回退到 gnu 版
+#   3. 下载后先在临时目录试运行 --version，只有真能跑才替换系统文件
+#   4. 替换失败自动回滚到旧版本
 ###############################################################################
 
 get_latest_version() {
@@ -267,47 +311,85 @@ get_target_arch() {
 }
 
 install_shadowsocks() {
-    local version arch tmp_dir archive url extracted_bin
+    local version arch tmp_dir archive extract_dir extracted_bin
+    local base_url variants variant ok
+
     info "正在获取 Shadowsocks-Rust 最新版本..."
     version="$(get_latest_version)" || die "无法获取 Shadowsocks-Rust 最新版本。"
     arch="$(get_target_arch)" || die "暂不支持当前 CPU 架构：$(uname -m)"
     info "最新版本：${version}"
     info "系统架构：${arch}"
+
     tmp_dir="$(mktemp -d)"
     archive="${tmp_dir}/shadowsocks-rust.tar.xz"
-    url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${version}/shadowsocks-v${version#v}.${arch}-unknown-linux-gnu.tar.xz"
-    info "下载：${url}"
-    if ! curl -fL --connect-timeout 15 --max-time 300 --retry 3 -o "${archive}" "${url}"; then
+
+    base_url="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${version}/shadowsocks-v${version#v}.${arch}-unknown-linux"
+    variants=("musl" "gnu")
+    ok=0
+
+    for variant in "${variants[@]}"; do
+        url="${base_url}-${variant}.tar.xz"
+        info "尝试下载（${variant}）：${url}"
+
+        rm -f "${archive}"
+        if ! curl -fL --connect-timeout 15 --max-time 300 --retry 3 -o "${archive}" "${url}"; then
+            warn "下载 ${variant} 版本失败，尝试下一个。"
+            continue
+        fi
+
+        info "正在解压 ${variant} 版本..."
+        extract_dir="${tmp_dir}/extract_${variant}"
+        rm -rf "${extract_dir}"
+        mkdir -p "${extract_dir}"
+        if ! tar -xJf "${archive}" -C "${extract_dir}"; then
+            warn "解压 ${variant} 版本失败，尝试下一个。"
+            continue
+        fi
+
+        extracted_bin="$(find "${extract_dir}" -type f -name 'ssserver' | head -n 1)"
+        if [[ -z "${extracted_bin}" || ! -f "${extracted_bin}" ]]; then
+            warn "${variant} 包中没有找到 ssserver，尝试下一个。"
+            continue
+        fi
+
+        chmod 755 "${extracted_bin}"
+
+        if ! "${extracted_bin}" --version >/dev/null 2>&1; then
+            warn "${variant} 版本无法运行（可能 glibc 不兼容），尝试下一个。"
+            continue
+        fi
+
+        ok=1
+        break
+    done
+
+    if (( ok == 0 )); then
         rm -rf "${tmp_dir}"
-        die "Shadowsocks-Rust 下载失败。"
+        die "Shadowsocks-Rust 安装失败：所有变体（musl / gnu）均不可用。"
     fi
-    info "正在解压..."
-    tar -xJf "${archive}" -C "${tmp_dir}"
-    extracted_bin="$(find "${tmp_dir}" -type f -name 'ssserver' | head -n 1)"
-    if [[ -z "${extracted_bin}" || ! -f "${extracted_bin}" ]]; then
-        rm -rf "${tmp_dir}"
-        die "下载包中没有找到 ssserver。"
-    fi
-    chmod 755 "${extracted_bin}"
+
     [[ -f "${BIN_PATH}" ]] && cp -f "${BIN_PATH}" "${BIN_PATH}.bak"
     cp -f "${extracted_bin}" "${BIN_PATH}"
     chmod 755 "${BIN_PATH}"
     rm -rf "${tmp_dir}"
+
     if ! "${BIN_PATH}" --version >/dev/null 2>&1; then
         [[ -f "${BIN_PATH}.bak" ]] && mv -f "${BIN_PATH}.bak" "${BIN_PATH}"
         die "Shadowsocks-Rust 安装验证失败。"
     fi
     rm -f "${BIN_PATH}.bak"
+
     ok "Shadowsocks-Rust 安装完成。"
     "${BIN_PATH}" --version || true
 }
 
 ###############################################################################
-# 用户数据基础
+# 用户数据基础操作
 ###############################################################################
 
 get_user_count() { jq 'length' "${USERS_FILE}" 2>/dev/null || echo 0; }
 has_users() { [[ "$(get_user_count)" -gt 0 ]]; }
+
 has_enabled_users() {
     jq -e 'any(.[]; (.enabled // true) == true)' "${USERS_FILE}" >/dev/null 2>&1
 }
@@ -339,7 +421,7 @@ update_user_field_json() {
 }
 
 ###############################################################################
-# 迁移：补 periods / last_cycle_index / last_ipt_* / used_total
+# 数据迁移：为旧版 users.json 补齐缺失字段
 ###############################################################################
 
 migrate_users() {
@@ -363,12 +445,18 @@ migrate_users() {
             .disabled_reason = (.disabled_reason // "") |
             .method = (.method // "aes-256-gcm") |
 
-            .periods = (.periods // (
-                if (.expire // 0) > 0 and (.created_at // 0) > 0
-                then ([((.expire - .created_at) / 2592000) | floor, 1] | max)
-                else 1
+            # 注意：periods 允许为 0（永久用户），不能简单用 // 兜底
+            .periods = (
+                if has("periods") and (.periods | type == "number")
+                then .periods
+                else (
+                    if (.expire // 0) > 0 and (.created_at // 0) > 0
+                    then ([((.expire - .created_at) / 2592000) | floor, 1] | max)
+                    else 1
+                    end
+                )
                 end
-            )) |
+            ) |
 
             .last_cycle_index = (.last_cycle_index // (
                 if (.created_at // 0) > 0
@@ -417,7 +505,7 @@ current_cycle_index() {
 }
 
 ###############################################################################
-# 公网 IPv4
+# 获取服务器公网 IPv4
 ###############################################################################
 
 get_public_ipv4() {
@@ -432,7 +520,7 @@ get_public_ipv4() {
 }
 
 ###############################################################################
-# URL 编码 / SS 链接
+# URL 编码 与 SS 链接生成
 ###############################################################################
 
 url_encode() {
@@ -457,7 +545,7 @@ generate_ss_link() {
 }
 
 ###############################################################################
-# iptables
+# iptables 流量统计
 ###############################################################################
 
 in_chain()  { echo "ss-${1}-in"; }
@@ -582,7 +670,7 @@ check_user() {
 
     now="$(now_ts)"
 
-    # 1) 过期
+    # 1) 过期检查：expire > 0 才判断（expire=0 表示永久）
     if (( expire > 0 && now >= expire )); then
         if [[ "${enabled}" == "true" || "${reason}" != "expired" ]]; then
             remove_port_rules "${port}"
@@ -592,19 +680,21 @@ check_user() {
         return 0
     fi
 
-    # 2) 周期推进
-    idx="$(current_cycle_index "${created_at}" "${now}")"
-    if (( idx > last_cycle_index )); then
-        used=0
-        last_ipt_tcp=0
-        last_ipt_udp=0
-        last_cycle_index="${idx}"
+    # 2) 周期推进：永久用户（expire=0）不做周期重置，只累积
+    if (( expire > 0 )); then
+        idx="$(current_cycle_index "${created_at}" "${now}")"
+        if (( idx > last_cycle_index )); then
+            used=0
+            last_ipt_tcp=0
+            last_ipt_udp=0
+            last_cycle_index="${idx}"
 
-        if [[ "${reason}" == "traffic" ]]; then
-            remove_port_rules "${port}"
-            add_traffic_rules "${port}"
-            enabled=true
-            reason=""
+            if [[ "${reason}" == "traffic" ]]; then
+                remove_port_rules "${port}"
+                add_traffic_rules "${port}"
+                enabled=true
+                reason=""
+            fi
         fi
     fi
 
@@ -628,7 +718,7 @@ check_user() {
     last_ipt_tcp="${cur_tcp}"
     last_ipt_udp="${cur_udp}"
 
-    # 4) 超限
+    # 4) 超限封禁
     if [[ "${enabled}" == "true" && "${reason}" == "" ]] && (( limit > 0 )) && (( used >= limit )); then
         remove_port_rules "${port}"
         add_block_rules "${port}"
@@ -637,13 +727,12 @@ check_user() {
         warn "用户 ${u} 流量已超限：$(bytes_to_human "${used}") / $(bytes_to_human "${limit}")"
     fi
 
-    # 5) 写回
     update_user_field_json "${u}" \
         ".used = ${used} | .used_total = ${used_total} | .last_ipt_tcp = ${last_ipt_tcp} | .last_ipt_udp = ${last_ipt_udp} | .last_cycle_index = ${last_cycle_index} | .enabled = ${enabled} | .disabled_reason = \"${reason}\""
 }
 
 ###############################################################################
-# 重建 iptables
+# 重建所有 iptables 规则
 ###############################################################################
 
 rebuild_iptables() {
@@ -666,7 +755,7 @@ rebuild_iptables() {
 }
 
 ###############################################################################
-# 生成 config.json
+# 生成 ssserver 的 config.json
 ###############################################################################
 
 generate_config() {
@@ -706,7 +795,7 @@ validate_ss_config() {
 }
 
 ###############################################################################
-# systemd
+# systemd 服务
 ###############################################################################
 
 create_systemd_service() {
@@ -777,7 +866,7 @@ EOF
 }
 
 ###############################################################################
-# 自动流量检查
+# 定时任务执行的流量检查
 ###############################################################################
 
 traffic_check() {
@@ -844,14 +933,14 @@ check_port_conflict() {
 }
 
 ###############################################################################
-# 添加用户
+# 添加用户（★ 支持永久用户）
 ###############################################################################
 
 add_user() {
     title "添加 Shadowsocks 用户"
 
     local name port password method limit_input limit
-    local months now expire next_reset
+    local months_input months now expire next_reset
 
     read -r -p "用户名： " name
     [[ -z "${name}" ]] && { err "用户名不能为空。"; return 1; }
@@ -888,16 +977,23 @@ add_user() {
         limit=0
     fi
 
-    read -r -p "购买周期数（每个 30 天） [默认 1]： " months
-    months="${months:-1}"
-    if ! [[ "${months}" =~ ^[0-9]+$ ]] || (( months < 1 )); then
-        err "周期数无效。"
+    # ★ 支持 0 / 无限 / 永久 等输入
+    read -r -p "购买周期数（每个 30 天，填 0 或 无限 表示永久） [默认 1]： " months_input
+    months_input="${months_input:-1}"
+    if ! months="$(parse_periods "${months_input}")"; then
+        err "周期数无效（应为非负整数，或输入“无限/永久”）。"
         return 1
     fi
 
     now="$(now_ts)"
-    next_reset="$(calculate_next_reset "${now}" "${now}")"
-    expire=$(( now + months * RESET_SECONDS ))
+    if (( months == 0 )); then
+        # 永久用户：expire=0，periods=0
+        expire=0
+        next_reset=0
+    else
+        next_reset="$(calculate_next_reset "${now}" "${now}")"
+        expire=$(( now + months * RESET_SECONDS ))
+    fi
 
     local tmp
     tmp="$(mktemp)"
@@ -958,9 +1054,14 @@ add_user() {
     else
         pad_right "每月流量：" 16; echo "不限"
     fi
-    pad_right "周期数："   16; echo "${months}（每个 30 天）"
+    # ★ 永久用户显示"永久"
+    if (( months == 0 )); then
+        pad_right "周期数："   16; echo "永久（不限时间）"
+    else
+        pad_right "周期数："   16; echo "${months}（每个 30 天）"
+    fi
     pad_right "创建时间：" 16; echo "$(format_ts "${now}")"
-    pad_right "到期时间：" 16; echo "$(format_ts "${expire}")"
+    pad_right "到期时间：" 16; echo "$(format_expire "${expire}")"
     line
     if [[ -n "${ip}" ]]; then
         echo "ss:// 导入链接："
@@ -1014,7 +1115,7 @@ delete_user() {
 }
 
 ###############################################################################
-# 重置用户流量（纯重置）
+# 重置单用户本周期流量
 ###############################################################################
 
 reset_user_traffic() {
@@ -1032,6 +1133,7 @@ reset_user_traffic() {
     port="$(jq -r '.port' <<<"${json}")"
     now="$(now_ts)"
 
+    # expire>0 才判断是否到期（expire=0 永久）
     if (( expire > 0 && now >= expire )); then
         warn "该用户账号已到期，reset 不会恢复。请使用「续费」功能。"
         return 1
@@ -1054,7 +1156,7 @@ reset_user_traffic() {
 }
 
 ###############################################################################
-# 续费用户
+# 用户续费（★ 永久用户不参与）
 ###############################################################################
 
 renew_user() {
@@ -1073,6 +1175,12 @@ renew_user() {
     port="$(jq -r '.port' <<<"${json}")"
     created_at="$(jq -r '.created_at // 0' <<<"${json}")"
     now="$(now_ts)"
+
+    # ★ 永久用户直接跳过
+    if (( expire == 0 )); then
+        warn "该用户为永久账号，无需续费。"
+        return 0
+    fi
 
     echo "当前到期时间：$(format_ts "${expire}")"
     echo "当前周期数：${periods}"
@@ -1106,7 +1214,7 @@ renew_user() {
 }
 
 ###############################################################################
-# 重置全部流量
+# 重置全部用户流量
 ###############################################################################
 
 reset_all_traffic() {
@@ -1125,6 +1233,7 @@ reset_all_traffic() {
         expire="$(jq -r '.expire // 0' <<<"${json}")"
         port="$(jq -r '.port' <<<"${json}")"
 
+        # 只有 expire>0 且已过期才封禁；永久用户不受影响
         if (( expire > 0 && now >= expire )); then
             remove_port_rules "${port}"
             add_block_rules "${port}"
@@ -1145,7 +1254,7 @@ reset_all_traffic() {
 }
 
 ###############################################################################
-# 用户列表
+# 用户列表（★ 永久用户显示"永久"）
 ###############################################################################
 
 list_users() {
@@ -1200,7 +1309,7 @@ list_users() {
         pad_right "${port}"       "${W_PORT}";   printf '  '
         pad_right "${used_text}"  "${W_USED}";   printf '  '
         pad_right "${limit_text}" "${W_LIMIT}";  printf '  '
-        pad_right "$(format_ts "${expire}")" "${W_EXPIRE}"; printf '  '
+        pad_right "$(format_expire "${expire}")" "${W_EXPIRE}"; printf '  '
         pad_right "${status}"     "${W_STATUS}"
         echo
     done < <(jq -r '.[].name' "${USERS_FILE}")
@@ -1208,7 +1317,7 @@ list_users() {
 }
 
 ###############################################################################
-# 用户详情
+# 用户详情（★ 永久用户显示"永久"）
 ###############################################################################
 
 show_user() {
@@ -1229,7 +1338,7 @@ show_user() {
     limit="$(jq -r '.limit // 0' <<<"${json}")"
     used="$(jq -r '.used // 0' <<<"${json}")"
     expire="$(jq -r '.expire // 0' <<<"${json}")"
-    periods="$(jq -r '.periods // 1' <<<"${json}")"
+    periods="$(jq -r '.periods // 0' <<<"${json}")"
     enabled="$(jq -r '(.enabled // true)' <<<"${json}")"
     reason="$(jq -r '.disabled_reason // ""' <<<"${json}")"
     used_total="$(jq -r '.used_total // 0' <<<"${json}")"
@@ -1259,13 +1368,20 @@ show_user() {
     fi
 
     pad_right "累计流量：" 16; echo "$(bytes_to_human "${used_total}")"
-    pad_right "周期数："   16; echo "${periods}（每个 30 天）"
+
+    # ★ 永久用户显示"永久"
+    if (( expire == 0 )); then
+        pad_right "周期数："   16; echo "永久（不限时间）"
+    else
+        pad_right "周期数："   16; echo "${periods}（每个 30 天）"
+    fi
 
     if (( expire > 0 )); then
         pad_right "到期时间：" 16; echo "$(format_ts "${expire}")"
         pad_right "剩余："     16; echo "$(remaining_time "${expire}")"
     else
         pad_right "到期时间：" 16; echo "永久"
+        pad_right "剩余："     16; echo "永久"
     fi
 
     pad_right "状态：" 16
@@ -1285,7 +1401,7 @@ show_user() {
 }
 
 ###############################################################################
-# 导出全部链接
+# 导出全部用户 ss:// 链接
 ###############################################################################
 
 export_all_links() {
@@ -1348,7 +1464,7 @@ show_logs() {
 }
 
 ###############################################################################
-# 更新
+# 更新 Shadowsocks-Rust
 ###############################################################################
 
 update_shadowsocks() {
@@ -1376,7 +1492,7 @@ update_shadowsocks() {
 }
 
 ###############################################################################
-# 安装全部
+# 首次安装全流程
 ###############################################################################
 
 install_all() {
@@ -1550,7 +1666,7 @@ case "${1:-}" in
 esac
 
 ###############################################################################
-# 入口
+# 主入口
 ###############################################################################
 
 main() {
