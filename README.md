@@ -90,23 +90,10 @@
 
 ## 安装
 
-### 1. 下载脚本
-
 ```bash
-wget -O install.sh https://raw.githubusercontent.com/SunMoonWithYou/ss_manage/main/install.sh
+bash <(curl -fsSL https://raw.githubusercontent.com/SunMoonWithYou/ss_manage/main/install.sh?$(date +%s))
 ```
 
-### 2. 赋予执行权限
-
-```bash
-chmod +x install.sh
-```
-
-### 3. 运行
-
-```bash
-sudo ./install.sh
-```
 
 首次运行会自动：
 
