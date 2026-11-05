@@ -52,6 +52,9 @@
 - `expire = created_at + periods × 30 天`，独立存储
 - 每个周期边界自动重置 `used`，若之前因超限被禁用则自动恢复
 
+### 后台显示
+https://github.com/SunMoonWithYou/ss_monitoring_panel
+
 ### 状态
 
 | 状态 | 含义 | 触发 | 恢复方式 |
