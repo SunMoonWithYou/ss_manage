@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="banner.png" width="100%" alt="vnStat 流量统计 & Telegram 日报管理工具">
+</p>
+
 # Shadowsocks-Rust 多用户管理器
 
 一个基于 **Shadowsocks-Rust** 的轻量级多用户管理脚本，提供用户管理、流量统计、套餐周期、自动限速封禁、到期管理以及 Cloudflare Worker 云端同步等功能。
@@ -31,9 +35,6 @@
 - Ubuntu 系列 Linux 系统
 - x86_64 / amd64
 - ARM64 / aarch64
-<p align="center">
-  <img src="banner.png" width="100%" alt="vnStat 流量统计 & Telegram 日报管理工具">
-</p>
 
 ## 🚀 安装使用
 
